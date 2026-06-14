@@ -53,6 +53,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/SolarGuider.exe \
+          cp dist/SolarGuider.exe "SolarGuider-${GITHUB_REF_NAME}.exe"
+          gh release create "${GITHUB_REF_NAME}" "SolarGuider-${GITHUB_REF_NAME}.exe" \
             --title "${GITHUB_REF_NAME}" --generate-notes \
-          || gh release upload "${GITHUB_REF_NAME}" dist/SolarGuider.exe --clobber
+          || gh release upload "${GITHUB_REF_NAME}" "SolarGuider-${GITHUB_REF_NAME}.exe" --clobber
