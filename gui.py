@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -44,7 +45,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -103,7 +104,8 @@ class MainWindow(QMainWindow):
         self._prev_err_dec = None
 
         self.setWindowTitle(f"Sonnen-Guider v{APP_VERSION} – ZWO AM3")
-        self.resize(1040, 660)
+        self.resize(1000, 620)
+        self.setMinimumSize(640, 400)  # passt auch auf kleinere Bildschirme
 
         self._build_ui()
         self._init_from_cfg()
@@ -133,14 +135,19 @@ class MainWindow(QMainWindow):
         # ---- links: Livebild ----
         self.image_label = QLabel("Kein Bild - auf 'Bild starten' klicken")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(560, 560)
+        self.image_label.setMinimumSize(400, 400)
         self.image_label.setStyleSheet(
             "background-color: #202020; color: #888; font-size: 14px;")
         root.addWidget(self.image_label, stretch=3)
 
-        # ---- rechts: Bedienung ----
-        side = QVBoxLayout()
-        root.addLayout(side, stretch=2)
+        # ---- rechts: Bedienung (scrollbar, damit alles erreichbar ist) ----
+        side_container = QWidget()
+        side = QVBoxLayout(side_container)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(side_container)
+        scroll.setMinimumWidth(360)
+        root.addWidget(scroll, stretch=2)
 
         intro = QLabel("So geht's:  1) Bild starten   2) Montierung verbinden   "
                        "3) Guiding starten")
