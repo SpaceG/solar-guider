@@ -441,6 +441,15 @@ class ASCOMMount(MountInterface):
             return False
         try:
             if on:
+                # Viele Montierungen verweigern Tracking im geparkten Zustand:
+                # daher zuerst entparken, falls noetig/moeglich.
+                try:
+                    if (bool(getattr(self._scope, "CanUnpark", False))
+                            and bool(getattr(self._scope, "AtPark", False))):
+                        self._scope.Unpark()
+                        self._log("Montierung entparkt (Unpark).")
+                except Exception as exc:
+                    self._log(f"Unpark nicht moeglich: {exc}", level=logging.DEBUG)
                 # Wenn der Treiber es kann: auf Sonnen-Rate (driveSolar = 2).
                 try:
                     if bool(getattr(self._scope, "CanSetTrackingRate", False)):
@@ -448,8 +457,10 @@ class ASCOMMount(MountInterface):
                 except Exception:
                     pass
             self._scope.Tracking = bool(on)
-            self._log(f"Nachfuehrung (Tracking): {'AN' if on else 'AUS'}")
-            return bool(self._scope.Tracking) == bool(on)
+            ok = bool(self._scope.Tracking) == bool(on)
+            self._log(f"Nachfuehrung (Tracking): {'AN' if on else 'AUS'}"
+                      f"{'' if ok else ' - aber Montierung hat es NICHT uebernommen!'}")
+            return ok
         except Exception as exc:
             self._log(f"Tracking-Fehler: {exc}", level=logging.WARNING)
             return False
