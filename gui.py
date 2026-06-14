@@ -457,9 +457,10 @@ class MainWindow(QMainWindow):
         else:
             self.mount_status.setText("Montierung: Verbindung fehlgeschlagen")
             self.mount_status.setStyleSheet("color: #b00;")
-            self._log("Verbindung fehlgeschlagen. Sind ASCOM-Platform + "
-                      "ZWO-ASCOM-Treiber installiert und die AM3 per USB "
-                      "angesteckt und eingeschaltet?")
+            self._log("Verbindung fehlgeschlagen. Pruefe: AM3 an + per USB? "
+                      "ASCOM + ZWO-Treiber installiert? WICHTIG: anderes "
+                      "Steuerprogramm (z.B. SkyAtlas) vorher schliessen - die "
+                      "Montierung erlaubt meist nur EINE Verbindung.")
 
     def _disconnect_mount(self) -> None:
         if self.guiding:
@@ -482,15 +483,22 @@ class MainWindow(QMainWindow):
         if not self._mount_connected():
             self._log("Bewegungstest: bitte zuerst Montierung verbinden.")
             return
-        self._apply_settings()
         try:
-            self.mount.pulse(direction, self.cfg.manual_pulse_ms)
+            if hasattr(self.mount, "slew_start"):
+                # Sichtbare Bewegung: ca. 0,6 s slewen, dann sofort stoppen.
+                self.mount.slew_start(direction)
+                self._wait(0.6)
+                self.mount.slew_stop()
+            else:
+                self.mount.pulse(direction, self.cfg.manual_pulse_ms)
         except Exception as exc:
             self._log(f"Bewegungsfehler: {exc}")
 
     def _manual_stop(self) -> None:
         if self.mount is not None:
             try:
+                if hasattr(self.mount, "slew_stop"):
+                    self.mount.slew_stop()
                 self.mount.stop()
             except Exception:
                 pass

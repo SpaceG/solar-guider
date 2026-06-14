@@ -387,3 +387,49 @@ class ASCOMMount(MountInterface):
             self._log(f"ASCOM PulseGuide {d} {ms_clamped} ms")
         except Exception as exc:
             self._log(f"ASCOM PulseGuide-Fehler: {exc}", level=logging.ERROR)
+
+    # --------------------------------------------------------- sichtbarer Slew
+    # Achszuordnung fuer MoveAxis: 0 = primaer (RA/Az), 1 = sekundaer (Dec/Alt).
+    _AXIS = {"E": 0, "W": 0, "N": 1, "S": 1}
+    _SIGN = {"E": 1.0, "W": -1.0, "N": 1.0, "S": -1.0}
+
+    def _pick_rate(self, axis: int) -> float:
+        """Eine sichtbare, sichere Slew-Rate (deg/s) fuer MoveAxis waehlen."""
+        try:
+            rates = self._scope.AxisRates(axis)
+            if int(rates.Count) >= 1:
+                r = rates.Item(1)  # COM-Collections sind 1-basiert
+                lo = float(r.Minimum)
+                hi = float(r.Maximum)
+                # Ziel ~1 deg/s, in den erlaubten Bereich geklemmt.
+                return min(hi, max(lo, min(1.0, hi)))
+        except Exception:
+            pass
+        return 1.0
+
+    def slew_start(self, direction: str) -> None:
+        """Sichtbare Dauerbewegung starten (MoveAxis). Mit slew_stop beenden."""
+        d = (direction or "").strip().upper()
+        if d not in self._AXIS or not self.is_connected():
+            return
+        axis = self._AXIS[d]
+        rate = self._pick_rate(axis) * self._SIGN[d]
+        try:
+            self._scope.MoveAxis(axis, rate)
+            self._log(f"ASCOM MoveAxis Achse {axis} Rate {rate:.3f} ({d})")
+        except Exception as exc:
+            self._log(f"ASCOM MoveAxis-Fehler: {exc}", level=logging.WARNING)
+
+    def slew_stop(self) -> None:
+        """Beide Achsen anhalten (MoveAxis 0) und AbortSlew. Never raises."""
+        if not self.is_connected():
+            return
+        for axis in (0, 1):
+            try:
+                self._scope.MoveAxis(axis, 0.0)
+            except Exception:
+                pass
+        try:
+            self._scope.AbortSlew()
+        except Exception:
+            pass
