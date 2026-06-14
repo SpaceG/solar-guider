@@ -433,3 +433,29 @@ class ASCOMMount(MountInterface):
             self._scope.AbortSlew()
         except Exception:
             pass
+
+    # ------------------------------------------------------------- Nachfuehrung
+    def set_tracking(self, on: bool) -> bool:
+        """Nachfuehrung (Tracking) ein-/ausschalten; wenn moeglich Sonnen-Rate."""
+        if not self.is_connected():
+            return False
+        try:
+            if on:
+                # Wenn der Treiber es kann: auf Sonnen-Rate (driveSolar = 2).
+                try:
+                    if bool(getattr(self._scope, "CanSetTrackingRate", False)):
+                        self._scope.TrackingRate = 2
+                except Exception:
+                    pass
+            self._scope.Tracking = bool(on)
+            self._log(f"Nachfuehrung (Tracking): {'AN' if on else 'AUS'}")
+            return bool(self._scope.Tracking) == bool(on)
+        except Exception as exc:
+            self._log(f"Tracking-Fehler: {exc}", level=logging.WARNING)
+            return False
+
+    def is_tracking(self) -> bool:
+        try:
+            return self.is_connected() and bool(self._scope.Tracking)
+        except Exception:
+            return False

@@ -44,7 +44,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -217,8 +217,16 @@ class MainWindow(QMainWindow):
         self.mount_status.setStyleSheet("color: #b00;")
         lay.addWidget(self.mount_status, 3, 0, 1, 3)
 
-        # Kleiner Bewegungstest (kurze, sichere Impulse).
-        lay.addWidget(QLabel("Bewegungstest:"), 4, 0, 1, 3)
+        # Nachfuehrung (Tracking): haelt die Sonne grob; Basis fuer Guiding.
+        self.tracking_btn = QPushButton("Nachfuehrung (Tracking) EIN")
+        self.tracking_btn.clicked.connect(self._toggle_tracking)
+        lay.addWidget(self.tracking_btn, 4, 0, 1, 3)
+        self.tracking_status = QLabel("Nachfuehrung: aus")
+        self.tracking_status.setStyleSheet("color: #777;")
+        lay.addWidget(self.tracking_status, 5, 0, 1, 3)
+
+        # Kleiner Bewegungstest (kurze, sichtbare Bewegung).
+        lay.addWidget(QLabel("Bewegungstest:"), 6, 0, 1, 3)
         btn_row = QHBoxLayout()
         for text, direction in (("hoch N", "N"), ("runter S", "S"),
                                 ("links O", "E"), ("rechts W", "W")):
@@ -230,16 +238,16 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(stop_b)
         wrap = QWidget()
         wrap.setLayout(btn_row)
-        lay.addWidget(wrap, 5, 0, 1, 3)
+        lay.addWidget(wrap, 7, 0, 1, 3)
 
         # Regler: wie weit sich die Montierung pro Klick bewegt.
         self.step_label = QLabel("Bewegung pro Klick: 150 ms")
-        lay.addWidget(self.step_label, 6, 0, 1, 3)
+        lay.addWidget(self.step_label, 8, 0, 1, 3)
         self.step_slider = QSlider(Qt.Orientation.Horizontal)
         self.step_slider.setRange(20, 1000)
         self.step_slider.setValue(150)
         self.step_slider.valueChanged.connect(self._on_step_changed)
-        lay.addWidget(self.step_slider, 7, 0, 1, 3)
+        lay.addWidget(self.step_slider, 9, 0, 1, 3)
         return box
 
     def _build_guide_box(self) -> QGroupBox:
@@ -461,6 +469,7 @@ class MainWindow(QMainWindow):
         if ok:
             self.mount_status.setText("Montierung: verbunden")
             self.mount_status.setStyleSheet("color: #0a0;")
+            self._update_tracking_label()
         else:
             self.mount_status.setText("Montierung: Verbindung fehlgeschlagen")
             self.mount_status.setStyleSheet("color: #b00;")
@@ -481,10 +490,33 @@ class MainWindow(QMainWindow):
             self.mount = None
         self.mount_status.setText("Montierung: getrennt")
         self.mount_status.setStyleSheet("color: #b00;")
+        self._update_tracking_label()
         self._log("Montierung getrennt.")
 
     def _mount_connected(self) -> bool:
         return self.mount is not None and self.mount.is_connected()
+
+    def _toggle_tracking(self) -> None:
+        """Nachfuehrung (Tracking) ein-/ausschalten."""
+        if not self._mount_connected():
+            self._log("Nachfuehrung: bitte zuerst Montierung verbinden.")
+            return
+        want_on = not (hasattr(self.mount, "is_tracking") and self.mount.is_tracking())
+        if hasattr(self.mount, "set_tracking"):
+            self.mount.set_tracking(want_on)
+        self._update_tracking_label()
+
+    def _update_tracking_label(self) -> None:
+        on = (self.mount is not None and hasattr(self.mount, "is_tracking")
+              and self.mount.is_tracking())
+        if on:
+            self.tracking_status.setText("Nachfuehrung: AN")
+            self.tracking_status.setStyleSheet("color: #0a0;")
+            self.tracking_btn.setText("Nachfuehrung (Tracking) AUS")
+        else:
+            self.tracking_status.setText("Nachfuehrung: aus")
+            self.tracking_status.setStyleSheet("color: #777;")
+            self.tracking_btn.setText("Nachfuehrung (Tracking) EIN")
 
     def _manual_pulse(self, direction: str) -> None:
         if not self._mount_connected():
@@ -529,6 +561,10 @@ class MainWindow(QMainWindow):
                           "verbinden (Schritt 2).")
                 return
             self._apply_settings()
+            # Nachfuehrung sicherstellen (Basis fuer Guiding).
+            if hasattr(self.mount, "set_tracking"):
+                self.mount.set_tracking(True)
+                self._update_tracking_label()
             self.guiding = True
             self.last_correction = 0.0
             self.guide_btn.setText("GUIDING STOPPEN")
