@@ -32,7 +32,7 @@ class Config:
     deadband_px: int = 20
     max_pulse_ms: int = 300
     correction_interval: float = 1.0  # seconds between corrections
-    manual_pulse_ms: int = 200       # pulse length for manual N/S/E/W buttons
+    manual_pulse_ms: int = 150       # Bewegungsdauer pro manuellem Klick (ms)
     invert_ra: bool = False
     invert_dec: bool = False
     # --- calibration (px moved per ms of pulse); 0 means "not calibrated" ---

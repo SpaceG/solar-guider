@@ -401,8 +401,8 @@ class ASCOMMount(MountInterface):
                 r = rates.Item(1)  # COM-Collections sind 1-basiert
                 lo = float(r.Minimum)
                 hi = float(r.Maximum)
-                # Ziel ~1 deg/s, in den erlaubten Bereich geklemmt.
-                return min(hi, max(lo, min(1.0, hi)))
+                # Ziel ~0,5 deg/s (sanft), in den erlaubten Bereich geklemmt.
+                return min(hi, max(lo, min(0.5, hi)))
         except Exception:
             pass
         return 1.0

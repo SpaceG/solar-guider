@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -43,7 +44,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -230,6 +231,15 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wrap.setLayout(btn_row)
         lay.addWidget(wrap, 5, 0, 1, 3)
+
+        # Regler: wie weit sich die Montierung pro Klick bewegt.
+        self.step_label = QLabel("Bewegung pro Klick: 150 ms")
+        lay.addWidget(self.step_label, 6, 0, 1, 3)
+        self.step_slider = QSlider(Qt.Orientation.Horizontal)
+        self.step_slider.setRange(20, 1000)
+        self.step_slider.setValue(150)
+        self.step_slider.valueChanged.connect(self._on_step_changed)
+        lay.addWidget(self.step_slider, 7, 0, 1, 3)
         return box
 
     def _build_guide_box(self) -> QGroupBox:
@@ -296,12 +306,6 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.interval_spin, row, 1)
 
         row += 1
-        lay.addWidget(QLabel("Manueller Puls (ms):"), row, 0)
-        self.manualpulse_spin = QSpinBox()
-        self.manualpulse_spin.setRange(10, 1000)
-        lay.addWidget(self.manualpulse_spin, row, 1)
-
-        row += 1
         lay.addWidget(QLabel("Schwellwert (0-255):"), row, 0)
         self.threshold_spin = QSpinBox()
         self.threshold_spin.setRange(0, 255)
@@ -326,7 +330,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(save_btn, row, 0, 1, 2)
 
         # Aenderungen sofort in cfg uebernehmen.
-        for w in (self.deadband_spin, self.maxpulse_spin, self.manualpulse_spin,
+        for w in (self.deadband_spin, self.maxpulse_spin,
                   self.threshold_spin, self.minradius_spin):
             w.valueChanged.connect(self._apply_settings)
         self.interval_spin.valueChanged.connect(self._apply_settings)
@@ -351,7 +355,8 @@ class MainWindow(QMainWindow):
         self.deadband_spin.setValue(cfg.deadband_px)
         self.maxpulse_spin.setValue(cfg.max_pulse_ms)
         self.interval_spin.setValue(cfg.correction_interval)
-        self.manualpulse_spin.setValue(cfg.manual_pulse_ms)
+        self.step_slider.setValue(cfg.manual_pulse_ms)
+        self.step_label.setText(f"Bewegung pro Klick: {cfg.manual_pulse_ms} ms")
         self.threshold_spin.setValue(cfg.threshold)
         self.minradius_spin.setValue(cfg.min_radius)
         self.invert_ra_check.setChecked(cfg.invert_ra)
@@ -367,7 +372,6 @@ class MainWindow(QMainWindow):
         cfg.deadband_px = self.deadband_spin.value()
         cfg.max_pulse_ms = self.maxpulse_spin.value()
         cfg.correction_interval = self.interval_spin.value()
-        cfg.manual_pulse_ms = self.manualpulse_spin.value()
         cfg.threshold = self.threshold_spin.value()
         cfg.min_radius = self.minradius_spin.value()
         cfg.invert_ra = self.invert_ra_check.isChecked()
@@ -486,11 +490,12 @@ class MainWindow(QMainWindow):
         if not self._mount_connected():
             self._log("Bewegungstest: bitte zuerst Montierung verbinden.")
             return
+        # Dauer der Bewegung pro Klick kommt vom Schieberegler (in ms).
+        secs = max(0.02, self.cfg.manual_pulse_ms / 1000.0)
         try:
             if hasattr(self.mount, "slew_start"):
-                # Sichtbare Bewegung: ca. 0,6 s slewen, dann sofort stoppen.
                 self.mount.slew_start(direction)
-                self._wait(0.6)
+                self._wait(secs)
                 self.mount.slew_stop()
             else:
                 self.mount.pulse(direction, self.cfg.manual_pulse_ms)
@@ -505,6 +510,11 @@ class MainWindow(QMainWindow):
                 self.mount.stop()
             except Exception:
                 pass
+
+    def _on_step_changed(self, value: int) -> None:
+        """Schieberegler 'Bewegung pro Klick' -> cfg.manual_pulse_ms."""
+        self.cfg.manual_pulse_ms = int(value)
+        self.step_label.setText(f"Bewegung pro Klick: {int(value)} ms")
 
     # ---------------------------------------------------------------- Guiding
     def _toggle_guiding(self) -> None:
