@@ -45,7 +45,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -643,6 +643,7 @@ class MainWindow(QMainWindow):
             if cfg.invert_ra:
                 direction = _opposite(direction)
             error = ex
+            pxms = cfg.px_per_ms_ra
         else:
             if (self._prev_err_dec is not None
                     and abs(ey) > abs(self._prev_err_dec) + 8):
@@ -654,7 +655,15 @@ class MainWindow(QMainWindow):
             if cfg.invert_dec:
                 direction = _opposite(direction)
             error = ey
-        self._guide_nudge(direction, error)
+            pxms = cfg.px_per_ms_dec
+        # Feine Korrektur per PulseGuide (sanft, passend zur Vergroesserung) statt
+        # grobem MoveAxis. Dauer aus der Kalibrierung (px/ms), gedeckelt.
+        ms = _pulse_ms_for(abs(error), pxms, cfg.max_pulse_ms)
+        try:
+            self.mount.pulse(direction, ms)
+            self._log(f"Korrektur {direction} {ms} ms (Abw. {int(error)} px)")
+        except Exception as exc:
+            self._log(f"Guiding-Fehler: {exc}")
         self.last_correction = now
 
     def _guide_nudge(self, direction: str, error_px: float) -> None:
