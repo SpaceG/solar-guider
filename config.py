@@ -9,6 +9,7 @@ never raises.
 from dataclasses import dataclass, asdict, field
 import json
 import os
+import sys
 
 
 @dataclass
@@ -37,8 +38,17 @@ class Config:
     px_per_ms_dec: float = 0.0
 
 
-# Absolute path to "config.json" sitting next to this module.
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Directory that holds config.json. When running normally this is the folder of
+# this module; when running as a PyInstaller-frozen .exe, __file__ points into a
+# temporary extraction dir that is deleted on exit, so we use the folder of the
+# .exe instead so settings persist next to the executable.
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Absolute path to "config.json".
+CONFIG_PATH = os.path.join(_BASE_DIR, "config.json")
 
 
 def load_config() -> Config:

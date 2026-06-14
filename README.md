@@ -12,8 +12,28 @@ eine serielle COM-Schnittstelle mit LX200-ähnlichen Befehlen automatisch nachf�
 
 ---
 
+## Download (Windows .exe)
+
+Du musst nichts installieren, um die App auszuprobieren – es gibt eine fertige
+Windows-`.exe` zum Doppelklick-Start:
+
+**➡️ Neueste Version: <https://github.com/SpaceG/solar-guider/releases/latest>**
+
+1. Auf der Release-Seite unter **Assets** die Datei **`SolarGuider.exe`** herunterladen.
+2. Doppelklick zum Starten. (Windows SmartScreen kann beim ersten Mal warnen, da die
+   Datei nicht signiert ist → *Weitere Informationen* → *Trotzdem ausführen*.)
+3. Die App legt eine `config.json` neben der `.exe` an, in der deine Einstellungen
+   gespeichert werden.
+
+> Die `.exe` wird automatisch per GitHub Actions auf einem Windows-Runner gebaut
+> (siehe `.github/workflows/build-windows.yml`). Wer lieber aus dem Quellcode startet,
+> folgt dem Abschnitt [Installation](#installation).
+
+---
+
 ## Inhaltsverzeichnis
 
+0. [Download (Windows .exe)](#download-windows-exe)
 1. [Überblick](#überblick)
 2. [Projekt- und Modulstruktur](#projekt--und-modulstruktur)
 3. [Installation](#installation)
