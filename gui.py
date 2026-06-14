@@ -45,7 +45,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [

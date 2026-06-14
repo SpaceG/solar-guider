@@ -274,6 +274,7 @@ class ASCOMMount(MountInterface):
         self.prog_id = prog_id or ""
         self.logger = logger
         self._scope = None  # the COM object once connected
+        self._tracking_assumed = False  # Fallback, falls .Tracking-Lesen wirft
 
     # ------------------------------------------------------------------ logging
     def _log(self, message: str, level: int = logging.INFO) -> None:
@@ -439,34 +440,44 @@ class ASCOMMount(MountInterface):
         """Nachfuehrung (Tracking) ein-/ausschalten; wenn moeglich Sonnen-Rate."""
         if not self.is_connected():
             return False
+        if on:
+            # Manche Montierungen verweigern Tracking im geparkten Zustand.
+            try:
+                if (bool(getattr(self._scope, "CanUnpark", False))
+                        and bool(getattr(self._scope, "AtPark", False))):
+                    self._scope.Unpark()
+                    self._log("Montierung entparkt (Unpark).")
+            except Exception:
+                pass
+        # KEIN TrackingRate setzen — die Sonnen-Rate loest beim ASIMount-Treiber
+        # den 'StartIndex'-Fehler aus. Sidereal reicht; Rest macht das Guiding.
+        # Tracking setzen (ggf. mehrfach versuchen; der Treiber ist sprunghaft).
+        set_err = None
+        for _ in range(3):
+            try:
+                self._scope.Tracking = bool(on)
+                set_err = None
+                break
+            except Exception as exc:
+                set_err = exc
+        if set_err is not None:
+            self._log(f"Tracking setzen-Fehler: {set_err}", level=logging.WARNING)
+        # Zuruecklesen ist beim ASIMount-Treiber fehlerhaft -> tolerant behandeln:
+        # wenn das Lesen wirft, nehmen wir den gesetzten Wert als gueltig an.
+        state = on
         try:
-            if on:
-                # Viele Montierungen verweigern Tracking im geparkten Zustand:
-                # daher zuerst entparken, falls noetig/moeglich.
-                try:
-                    if (bool(getattr(self._scope, "CanUnpark", False))
-                            and bool(getattr(self._scope, "AtPark", False))):
-                        self._scope.Unpark()
-                        self._log("Montierung entparkt (Unpark).")
-                except Exception as exc:
-                    self._log(f"Unpark nicht moeglich: {exc}", level=logging.DEBUG)
-                # Wenn der Treiber es kann: auf Sonnen-Rate (driveSolar = 2).
-                try:
-                    if bool(getattr(self._scope, "CanSetTrackingRate", False)):
-                        self._scope.TrackingRate = 2
-                except Exception:
-                    pass
-            self._scope.Tracking = bool(on)
-            ok = bool(self._scope.Tracking) == bool(on)
-            self._log(f"Nachfuehrung (Tracking): {'AN' if on else 'AUS'}"
-                      f"{'' if ok else ' - aber Montierung hat es NICHT uebernommen!'}")
-            return ok
-        except Exception as exc:
-            self._log(f"Tracking-Fehler: {exc}", level=logging.WARNING)
-            return False
+            state = bool(self._scope.Tracking)
+        except Exception:
+            state = on
+        self._tracking_assumed = state
+        self._log(f"Nachfuehrung (Tracking): {'AN' if state else 'AUS'}")
+        return state
 
     def is_tracking(self) -> bool:
-        try:
-            return self.is_connected() and bool(self._scope.Tracking)
-        except Exception:
+        if not self.is_connected():
             return False
+        try:
+            return bool(self._scope.Tracking)
+        except Exception:
+            # Treiber wirft beim Lesen -> zuletzt gesetzten Wert annehmen.
+            return self._tracking_assumed
