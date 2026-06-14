@@ -16,6 +16,7 @@ NOTE: This module must NOT be imported by config.py (would create a cycle).
 from __future__ import annotations
 
 import glob
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -135,21 +136,57 @@ class FolderImageSource(ImageSource):
         return bool(self.folder) and os.path.isdir(self.folder)
 
 
+class DemoImageSource(ImageSource):
+    """Synthetic image source — a bright "sun" disk that slowly drifts.
+
+    Lets the user immediately see the detection/overlay working with NO camera,
+    folder, or hardware attached. The disk drifts on a slow circular path so the
+    measured drift (``dx``/``dy``) and overlay visibly change frame to frame.
+    """
+
+    def __init__(self, width: int = 640, height: int = 480, radius: int = 70):
+        self.width = width
+        self.height = height
+        self.radius = radius
+        self._t = 0  # frame counter, drives the drift animation
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        h, w = self.height, self.width
+        # Dark grey background with a hint of noise so it looks like real sky.
+        frame = np.full((h, w, 3), 18, dtype=np.uint8)
+        # Slow circular drift around the image centre.
+        self._t += 1
+        cx = int(w / 2 + 70 * math.cos(self._t * 0.04))
+        cy = int(h / 2 + 45 * math.sin(self._t * 0.04))
+        # Draw a filled, slightly warm-white sun disk (BGR).
+        cv2.circle(frame, (cx, cy), self.radius, (235, 245, 255), -1, cv2.LINE_AA)
+        return frame
+
+    def release(self) -> None:
+        pass
+
+    def is_opened(self) -> bool:
+        return True
+
+
 def create_source(cfg: "Config") -> ImageSource:
     """Create an :class:`ImageSource` from a ``Config``.
 
     Dispatches on ``cfg.source_type``: ``"camera"`` -> :class:`OpenCVCamera`,
-    anything else (default ``"folder"``) -> :class:`FolderImageSource`.
+    ``"demo"`` -> :class:`DemoImageSource`, anything else (``"folder"``) ->
+    :class:`FolderImageSource`.
 
     Never raises. On malformed config it returns a source that reports
     ``is_opened() == False`` so callers can degrade gracefully.
     """
     try:
-        source_type = getattr(cfg, "source_type", "folder")
+        source_type = getattr(cfg, "source_type", "demo")
         if source_type == "camera":
             return OpenCVCamera(getattr(cfg, "camera_index", 0))
+        if source_type == "demo":
+            return DemoImageSource()
         return FolderImageSource(getattr(cfg, "sharpcap_folder", ""))
     except Exception as exc:
-        print(f"[create_source] Falling back to closed source: {exc}")
-        # Guaranteed-closed fallback: an empty folder source.
-        return FolderImageSource("")
+        print(f"[create_source] Falling back to demo source: {exc}")
+        # Guaranteed-open fallback so the user always sees something.
+        return DemoImageSource()

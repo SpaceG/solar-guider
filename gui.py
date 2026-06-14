@@ -1,43 +1,34 @@
-"""gui.py — PyQt6 user interface for the Simple Solar Guider.
+"""gui.py — Einfache deutsche Oberfläche für den Sonnen-Guider (ZWO AM3).
 
-Provides :class:`MainWindow`, the single top-level window. It wires together
-the four backend modules (config, camera, image_processing, mount_control) into
-a live capture/guide loop:
+Bewusst simpel gehalten: drei klare Schritte (Bild → Montierung → Guiding) und
+ein großer Start-Knopf. Beim Start zeigt die App automatisch ein Demo-Testbild,
+damit man die Sonnenerkennung sofort sieht – ganz ohne Kamera/Hardware.
 
-    left panel   : the live image with detection overlay (scaled QLabel)
-    right panel  : source selection, live toggle, mount connection, manual
-                   slew buttons, calibration, auto-guide, settings, EMERGENCY
-                   STOP, and a read-only log view.
-
-A ~15 fps QTimer drives the capture loop: grab a frame -> detect_sun ->
-draw_overlay -> show -> update status -> (optionally) run one guiding step.
-
-SAFETY: no motion is ever commanded unless Auto Guide is ON, the sun is
-detected, AND the mount is connected. The capture tick is wrapped in
-try/except so a single bad frame can never crash the UI.
+Genutzte Module (gleiche Schnittstellen wie zuvor):
+  config.py            – Einstellungen laden/speichern
+  camera.py            – Bildquellen (Demo / Kamera / Ordner)
+  image_processing.py  – Sonnenerkennung + Overlay
+  mount_control.py     – serielle Montierungssteuerung (LX200)
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 import numpy as np
-
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
@@ -46,754 +37,628 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-# Plain module-name imports — main.py runs from inside the package dir so these
-# resolve against sys.path[0]. Do NOT prefix with the package name.
+from camera import create_source
 from config import Config, load_config, save_config
-from camera import create_source, ImageSource
-from image_processing import detect_sun, draw_overlay, SunDetection
-from mount_control import SerialMount, list_serial_ports
+from image_processing import SunDetection, detect_sun, draw_overlay
+from mount_control import ASCOMMount
+
+# Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
+_SOURCE_LABELS = [
+    ("Demo (Testbild)", "demo"),
+    ("Kamera", "camera"),
+    ("Ordner (SharpCap)", "folder"),
+]
 
 
-# --------------------------------------------------------------------------- #
-# Pure guiding helpers (kept module-level per contract).
-# --------------------------------------------------------------------------- #
-def opposite(direction: str) -> str:
-    """Return the opposite cardinal direction (E<->W, N<->S)."""
-    return {"E": "W", "W": "E", "N": "S", "S": "N"}.get(direction, direction)
+def _opposite(direction: str) -> str:
+    """Gegenrichtung: N<->S, E<->W."""
+    return {"N": "S", "S": "N", "E": "W", "W": "E"}.get(direction, direction)
 
 
-def _clamp(value: int, lo: int, hi: int) -> int:
-    """Clamp ``value`` into the inclusive integer range [lo, hi]."""
-    return max(lo, min(hi, value))
+def _pulse_ms_for(px: float, px_per_ms: float, max_ms: int) -> int:
+    """Pulslänge in ms für einen Drift von ``px`` Pixeln.
 
-
-def pulse_ms_for(px: float, px_per_ms: float, max_ms: int) -> int:
-    """Compute a guide-pulse length (ms) to correct ``px`` pixels of error.
-
-    If calibrated (``px_per_ms`` > 0), scale the error by the calibration and
-    clamp to ``[0, max_ms]``. When uncalibrated, fall back to a conservative
-    fixed pulse of ``min(150, max_ms)``.
+    Mit Kalibrierung proportional, sonst konservativer Festwert. Immer auf
+    ``[0, max_ms]`` begrenzt.
     """
     if px_per_ms and px_per_ms > 0:
-        return _clamp(int(px / px_per_ms), 0, max_ms)
+        return max(0, min(int(px / px_per_ms), max_ms))
     return min(150, max_ms)
 
 
-# --------------------------------------------------------------------------- #
-# Logging bridge: route the mount logger into the GUI's text panel.
-# --------------------------------------------------------------------------- #
-class _QtLogHandler(logging.Handler):
-    """A logging.Handler that appends formatted records to a QPlainTextEdit.
+class _LogHandler(logging.Handler):
+    """Leitet Log-Meldungen (z. B. gesendete Mount-Befehle) ins Log-Fenster."""
 
-    The actual widget append is marshalled through a Qt signal so log records
-    emitted from any thread are delivered safely on the GUI thread.
-    """
-
-    class _Emitter(QWidget):
-        message = pyqtSignal(str)
-
-    def __init__(self, text_widget: QPlainTextEdit):
+    def __init__(self, append_fn):
         super().__init__()
-        self._emitter = self._Emitter()
-        self._emitter.message.connect(text_widget.appendPlainText)
+        self._append = append_fn
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def emit(self, record):
         try:
-            self._emitter.message.emit(self.format(record))
+            self._append(self.format(record))
         except Exception:
-            # Logging must never crash the app.
             pass
 
 
-# --------------------------------------------------------------------------- #
-# Main window.
-# --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
-    """Top-level window driving capture, detection, display, and guiding."""
+    """Hauptfenster: links Livebild, rechts drei einfache Schritte."""
 
-    FPS = 15  # capture-loop target frame rate
-
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("Simple Solar Guider")
-
-        # --- runtime state -------------------------------------------------- #
         self.cfg: Config = load_config()
-        self.source: Optional[ImageSource] = None
-        self.mount: Optional[SerialMount] = None
-        self.live: bool = False
-        self.last_correction_time: float = 0.0
-        self.last_detection: Optional[SunDetection] = None
-        # Per-module logger surfaced in the GUI log panel.
+        self.source = None          # aktuelle Bildquelle (ImageSource) oder None
+        self.mount = None           # ASCOMMount oder None
+        self.guiding = False        # läuft Auto-Guiding gerade?
+        self.last_correction = 0.0  # Zeitpunkt der letzten Korrektur (monotonic)
+        self.last_detection: SunDetection | None = None
+
+        self.setWindowTitle("Sonnen-Guider – ZWO AM3")
+        self.resize(1040, 660)
+
+        self._build_ui()
+        self._init_from_cfg()
+
+        # Logger für Montierungsbefehle -> Log-Fenster.
         self.logger = logging.getLogger("solar_guider")
         self.logger.setLevel(logging.INFO)
+        self.logger.handlers.clear()
+        h = _LogHandler(self.log_view.appendPlainText)
+        h.setFormatter(logging.Formatter("%(message)s"))
+        self.logger.addHandler(h)
 
-        # --- build UI ------------------------------------------------------- #
-        self._build_ui()
-        self._attach_logging()
-        self._populate_from_config()
-
-        # --- capture timer -------------------------------------------------- #
+        # Aufnahmeschleife (~15 Bilder/s).
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.setInterval(int(1000 / self.FPS))
+        self.timer.timeout.connect(self._on_tick)
+        self.timer.setInterval(66)
 
-        self._log("Solar Guider ready. Configure a source and press Start Live.")
+        self._log("Bereit. Tipp: oben rechts auf 'Bild starten' klicken - "
+                  "es laeuft ein Demo-Testbild.")
 
-    # ------------------------------------------------------------------ UI -- #
+    # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        """Construct and lay out all widgets."""
         central = QWidget()
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # ---------------- LEFT: live image ---------------- #
-        self.image_label = QLabel("No image")
+        # ---- links: Livebild ----
+        self.image_label = QLabel("Kein Bild - auf 'Bild starten' klicken")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(640, 480)
-        self.image_label.setFrameShape(QFrame.Shape.Box)
-        self.image_label.setStyleSheet("background-color: #202020; color: #888;")
+        self.image_label.setMinimumSize(560, 560)
+        self.image_label.setStyleSheet(
+            "background-color: #202020; color: #888; font-size: 14px;")
         root.addWidget(self.image_label, stretch=3)
 
-        # ---------------- RIGHT: controls ---------------- #
-        right = QVBoxLayout()
-        right.addWidget(self._build_source_group())
-        right.addWidget(self._build_mount_group())
-        right.addWidget(self._build_manual_group())
-        right.addWidget(self._build_guide_group())
-        right.addWidget(self._build_settings_group())
-        right.addWidget(self._build_emergency_button())
-        right.addWidget(self._build_log_group(), stretch=1)
+        # ---- rechts: Bedienung ----
+        side = QVBoxLayout()
+        root.addLayout(side, stretch=2)
 
-        right_container = QWidget()
-        right_container.setLayout(right)
-        right_container.setMinimumWidth(360)
-        root.addWidget(right_container, stretch=1)
+        intro = QLabel("So geht's:  1) Bild starten   2) Montierung verbinden   "
+                       "3) Guiding starten")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-weight: bold;")
+        side.addWidget(intro)
 
-    def _build_source_group(self) -> QGroupBox:
-        box = QGroupBox("Image Source")
+        side.addWidget(self._build_image_box())
+        side.addWidget(self._build_mount_box())
+        side.addWidget(self._build_guide_box())
+        side.addWidget(self._build_emergency_button())
+        side.addWidget(self._build_advanced_box())
+
+        log_box = QGroupBox("Meldungen")
+        log_lay = QVBoxLayout(log_box)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)
+        self.log_view.setFixedHeight(110)
+        log_lay.addWidget(self.log_view)
+        side.addWidget(log_box)
+
+        side.addStretch(1)
+
+    def _build_image_box(self) -> QGroupBox:
+        box = QGroupBox("1. Bild")
         lay = QGridLayout(box)
 
+        lay.addWidget(QLabel("Quelle:"), 0, 0)
         self.source_combo = QComboBox()
-        self.source_combo.addItems(["Folder", "Camera"])
-        lay.addWidget(QLabel("Source:"), 0, 0)
-        lay.addWidget(self.source_combo, 0, 1)
+        for label, _ in _SOURCE_LABELS:
+            self.source_combo.addItem(label)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        lay.addWidget(self.source_combo, 0, 1, 1, 2)
 
-        self.camera_index_spin = QSpinBox()
-        self.camera_index_spin.setRange(0, 16)
-        lay.addWidget(QLabel("Camera index:"), 1, 0)
-        lay.addWidget(self.camera_index_spin, 1, 1)
+        self.cam_label = QLabel("Kamera-Nr.:")
+        lay.addWidget(self.cam_label, 1, 0)
+        self.cam_index = QSpinBox()
+        self.cam_index.setRange(0, 10)
+        lay.addWidget(self.cam_index, 1, 1)
 
-        self.browse_btn = QPushButton("Browse SharpCap folder")
-        self.browse_btn.clicked.connect(self._on_browse_folder)
+        self.browse_btn = QPushButton("Ordner waehlen ...")
+        self.browse_btn.clicked.connect(self._browse_folder)
         lay.addWidget(self.browse_btn, 2, 0, 1, 2)
-
-        self.folder_label = QLabel("(no folder selected)")
+        self.folder_label = QLabel("(kein Ordner gewaehlt)")
+        self.folder_label.setStyleSheet("color: #777;")
         self.folder_label.setWordWrap(True)
-        self.folder_label.setStyleSheet("color: #555;")
-        lay.addWidget(self.folder_label, 3, 0, 1, 2)
+        lay.addWidget(self.folder_label, 3, 0, 1, 3)
 
-        self.live_btn = QPushButton("Start Live")
-        self.live_btn.setCheckable(True)
-        self.live_btn.clicked.connect(self._on_toggle_live)
-        lay.addWidget(self.live_btn, 4, 0, 1, 2)
+        self.live_btn = QPushButton(">  Bild starten")
+        self.live_btn.setMinimumHeight(34)
+        self.live_btn.clicked.connect(self._toggle_live)
+        lay.addWidget(self.live_btn, 4, 0, 1, 3)
 
+        self.detect_label = QLabel("Status: -")
+        lay.addWidget(self.detect_label, 5, 0, 1, 3)
         return box
 
-    def _build_mount_group(self) -> QGroupBox:
-        box = QGroupBox("Mount (Serial)")
+    def _build_mount_box(self) -> QGroupBox:
+        box = QGroupBox("2. Montierung (ZWO AM3 ueber ASCOM)")
         lay = QGridLayout(box)
 
-        self.port_combo = QComboBox()
-        lay.addWidget(QLabel("COM port:"), 0, 0)
-        lay.addWidget(self.port_combo, 0, 1)
+        self.choose_btn = QPushButton("Montierung waehlen (ASCOM) ...")
+        self.choose_btn.clicked.connect(self._choose_mount)
+        lay.addWidget(self.choose_btn, 0, 0, 1, 3)
 
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self._refresh_ports)
-        lay.addWidget(self.refresh_btn, 0, 2)
+        self.ascom_label = QLabel("(keine Montierung gewaehlt)")
+        self.ascom_label.setStyleSheet("color: #777;")
+        self.ascom_label.setWordWrap(True)
+        lay.addWidget(self.ascom_label, 1, 0, 1, 3)
 
-        self.baud_edit = QLineEdit("9600")
-        lay.addWidget(QLabel("Baudrate:"), 1, 0)
-        lay.addWidget(self.baud_edit, 1, 1, 1, 2)
+        self.connect_btn = QPushButton("Verbinden")
+        self.connect_btn.clicked.connect(self._connect_mount)
+        lay.addWidget(self.connect_btn, 2, 0)
+        self.disconnect_btn = QPushButton("Trennen")
+        self.disconnect_btn.clicked.connect(self._disconnect_mount)
+        lay.addWidget(self.disconnect_btn, 2, 1)
 
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._on_connect)
-        lay.addWidget(self.connect_btn, 2, 0, 1, 2)
+        self.mount_status = QLabel("Montierung: getrennt")
+        self.mount_status.setStyleSheet("color: #b00;")
+        lay.addWidget(self.mount_status, 3, 0, 1, 3)
 
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self._on_disconnect)
-        lay.addWidget(self.disconnect_btn, 2, 2)
-
-        self.mount_status_label = QLabel("Mount: disconnected")
-        self.mount_status_label.setStyleSheet("color: #b00;")
-        lay.addWidget(self.mount_status_label, 3, 0, 1, 3)
-
-        self._refresh_ports()
+        # Kleiner Bewegungstest (kurze, sichere Impulse).
+        lay.addWidget(QLabel("Bewegungstest:"), 4, 0, 1, 3)
+        btn_row = QHBoxLayout()
+        for text, direction in (("hoch N", "N"), ("runter S", "S"),
+                                ("links O", "E"), ("rechts W", "W")):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, d=direction: self._manual_pulse(d))
+            btn_row.addWidget(b)
+        stop_b = QPushButton("Stop")
+        stop_b.clicked.connect(self._manual_stop)
+        btn_row.addWidget(stop_b)
+        wrap = QWidget()
+        wrap.setLayout(btn_row)
+        lay.addWidget(wrap, 5, 0, 1, 3)
         return box
 
-    def _build_manual_group(self) -> QGroupBox:
-        box = QGroupBox("Manual Slew (guide pulses)")
-        lay = QGridLayout(box)
-
-        self.north_btn = QPushButton("North")
-        self.south_btn = QPushButton("South")
-        self.east_btn = QPushButton("East")
-        self.west_btn = QPushButton("West")
-        self.stop_btn = QPushButton("Stop")
-
-        self.north_btn.clicked.connect(lambda: self._manual_pulse("N"))
-        self.south_btn.clicked.connect(lambda: self._manual_pulse("S"))
-        self.east_btn.clicked.connect(lambda: self._manual_pulse("E"))
-        self.west_btn.clicked.connect(lambda: self._manual_pulse("W"))
-        self.stop_btn.clicked.connect(self._on_stop)
-
-        # Cross layout: N on top, W/Stop/E in the middle, S on the bottom.
-        lay.addWidget(self.north_btn, 0, 1)
-        lay.addWidget(self.west_btn, 1, 0)
-        lay.addWidget(self.stop_btn, 1, 1)
-        lay.addWidget(self.east_btn, 1, 2)
-        lay.addWidget(self.south_btn, 2, 1)
-        return box
-
-    def _build_guide_group(self) -> QGroupBox:
-        box = QGroupBox("Auto Guide")
+    def _build_guide_box(self) -> QGroupBox:
+        box = QGroupBox("3. Guiding")
         lay = QVBoxLayout(box)
 
-        self.auto_guide_check = QCheckBox("Enable Auto Guide")
-        self.auto_guide_check.setChecked(False)  # DEFAULT UNCHECKED (safety)
-        lay.addWidget(self.auto_guide_check)
+        info = QLabel("Haelt die Sonne automatisch in der Bildmitte.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
 
-        self.calibrate_btn = QPushButton("Calibrate")
-        self.calibrate_btn.clicked.connect(self._on_calibrate)
+        self.guide_btn = QPushButton("GUIDING STARTEN")
+        self.guide_btn.setMinimumHeight(48)
+        self.guide_btn.setStyleSheet(
+            "QPushButton { background-color: #1e8449; color: white; "
+            "font-size: 16px; font-weight: bold; border-radius: 6px; }"
+            "QPushButton:pressed { background-color: #166036; }")
+        self.guide_btn.clicked.connect(self._toggle_guiding)
+        lay.addWidget(self.guide_btn)
+
+        self.calibrate_btn = QPushButton("Kalibrieren (optional)")
+        self.calibrate_btn.clicked.connect(self._calibrate)
         lay.addWidget(self.calibrate_btn)
-
         self.calib_label = QLabel("RA: 0.000 px/ms   DEC: 0.000 px/ms")
-        self.calib_label.setStyleSheet("color: #555;")
+        self.calib_label.setStyleSheet("color: #777;")
         lay.addWidget(self.calib_label)
         return box
 
-    def _build_settings_group(self) -> QGroupBox:
-        box = QGroupBox("Settings")
-        lay = QGridLayout(box)
-        row = 0
-
-        self.deadband_spin = QSpinBox()
-        self.deadband_spin.setRange(0, 2000)
-        lay.addWidget(QLabel("Deadband (px):"), row, 0)
-        lay.addWidget(self.deadband_spin, row, 1)
-        row += 1
-
-        self.max_pulse_spin = QSpinBox()
-        self.max_pulse_spin.setRange(0, 5000)
-        lay.addWidget(QLabel("Max pulse (ms):"), row, 0)
-        lay.addWidget(self.max_pulse_spin, row, 1)
-        row += 1
-
-        self.interval_spin = QDoubleSpinBox()
-        self.interval_spin.setRange(0.0, 60.0)
-        self.interval_spin.setSingleStep(0.1)
-        self.interval_spin.setDecimals(2)
-        lay.addWidget(QLabel("Correction interval (s):"), row, 0)
-        lay.addWidget(self.interval_spin, row, 1)
-        row += 1
-
-        self.manual_pulse_spin = QSpinBox()
-        self.manual_pulse_spin.setRange(0, 5000)
-        lay.addWidget(QLabel("Manual pulse (ms):"), row, 0)
-        lay.addWidget(self.manual_pulse_spin, row, 1)
-        row += 1
-
-        self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(0, 255)
-        lay.addWidget(QLabel("Threshold (0-255):"), row, 0)
-        lay.addWidget(self.threshold_spin, row, 1)
-        row += 1
-
-        self.min_radius_spin = QSpinBox()
-        self.min_radius_spin.setRange(0, 5000)
-        lay.addWidget(QLabel("Min radius (px):"), row, 0)
-        lay.addWidget(self.min_radius_spin, row, 1)
-        row += 1
-
-        self.invert_ra_check = QCheckBox("Invert RA (E<->W)")
-        lay.addWidget(self.invert_ra_check, row, 0, 1, 2)
-        row += 1
-
-        self.invert_dec_check = QCheckBox("Invert DEC (N<->S)")
-        lay.addWidget(self.invert_dec_check, row, 0, 1, 2)
-        row += 1
-
-        self.save_btn = QPushButton("Save settings")
-        self.save_btn.clicked.connect(self._on_save_settings)
-        lay.addWidget(self.save_btn, row, 0, 1, 2)
-        return box
-
     def _build_emergency_button(self) -> QPushButton:
-        self.emergency_btn = QPushButton("EMERGENCY STOP")
-        self.emergency_btn.setMinimumHeight(56)
+        self.emergency_btn = QPushButton("NOT-AUS")
+        self.emergency_btn.setMinimumHeight(46)
         self.emergency_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
-            "font-size: 18px; font-weight: bold; border-radius: 6px; }"
-            "QPushButton:pressed { background-color: #922b21; }"
-        )
-        self.emergency_btn.clicked.connect(self._on_emergency_stop)
+            "font-size: 16px; font-weight: bold; border-radius: 6px; }"
+            "QPushButton:pressed { background-color: #922b21; }")
+        self.emergency_btn.clicked.connect(self._emergency_stop)
         return self.emergency_btn
 
-    def _build_log_group(self) -> QGroupBox:
-        box = QGroupBox("Log")
-        lay = QVBoxLayout(box)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)  # cap memory growth
-        lay.addWidget(self.log_view)
+    def _build_advanced_box(self) -> QGroupBox:
+        box = QGroupBox("Erweiterte Einstellungen (fuer Fortgeschrittene)")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        content = QWidget()
+        outer.addWidget(content)
+        lay = QGridLayout(content)
+
+        row = 0
+        lay.addWidget(QLabel("Totband (px):"), row, 0)
+        self.deadband_spin = QSpinBox()
+        self.deadband_spin.setRange(1, 500)
+        lay.addWidget(self.deadband_spin, row, 1)
+
+        row += 1
+        lay.addWidget(QLabel("Max. Puls (ms):"), row, 0)
+        self.maxpulse_spin = QSpinBox()
+        self.maxpulse_spin.setRange(10, 1000)
+        lay.addWidget(self.maxpulse_spin, row, 1)
+
+        row += 1
+        lay.addWidget(QLabel("Korrektur-Intervall (s):"), row, 0)
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(0.2, 30.0)
+        self.interval_spin.setSingleStep(0.5)
+        lay.addWidget(self.interval_spin, row, 1)
+
+        row += 1
+        lay.addWidget(QLabel("Manueller Puls (ms):"), row, 0)
+        self.manualpulse_spin = QSpinBox()
+        self.manualpulse_spin.setRange(10, 1000)
+        lay.addWidget(self.manualpulse_spin, row, 1)
+
+        row += 1
+        lay.addWidget(QLabel("Schwellwert (0-255):"), row, 0)
+        self.threshold_spin = QSpinBox()
+        self.threshold_spin.setRange(0, 255)
+        lay.addWidget(self.threshold_spin, row, 1)
+
+        row += 1
+        lay.addWidget(QLabel("Min. Radius (px):"), row, 0)
+        self.minradius_spin = QSpinBox()
+        self.minradius_spin.setRange(1, 500)
+        lay.addWidget(self.minradius_spin, row, 1)
+
+        row += 1
+        self.invert_ra_check = QCheckBox("RA umkehren (O<->W)")
+        lay.addWidget(self.invert_ra_check, row, 0, 1, 2)
+        row += 1
+        self.invert_dec_check = QCheckBox("DEC umkehren (N<->S)")
+        lay.addWidget(self.invert_dec_check, row, 0, 1, 2)
+
+        row += 1
+        save_btn = QPushButton("Einstellungen speichern")
+        save_btn.clicked.connect(self._save_settings)
+        lay.addWidget(save_btn, row, 0, 1, 2)
+
+        # Aenderungen sofort in cfg uebernehmen.
+        for w in (self.deadband_spin, self.maxpulse_spin, self.manualpulse_spin,
+                  self.threshold_spin, self.minradius_spin):
+            w.valueChanged.connect(self._apply_settings)
+        self.interval_spin.valueChanged.connect(self._apply_settings)
+        self.invert_ra_check.toggled.connect(self._apply_settings)
+        self.invert_dec_check.toggled.connect(self._apply_settings)
+
+        box.toggled.connect(content.setVisible)
+        content.setVisible(False)
         return box
 
-    # -------------------------------------------------------------- logging -- #
-    def _attach_logging(self) -> None:
-        """Route the GUI logger into the on-screen log panel."""
-        handler = _QtLogHandler(self.log_view)
-        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
-        self.logger.addHandler(handler)
-        self._log_handler = handler  # keep a ref so it isn't GC'd
-
-    def _log(self, message: str) -> None:
-        """Convenience: log an INFO message (shown in the GUI panel)."""
-        self.logger.info(message)
-
-    # ----------------------------------------------------- config <-> widgets #
-    def _populate_from_config(self) -> None:
-        """Initialise all widgets from ``self.cfg``."""
+    # -------------------------------------------------------------- cfg <-> UI
+    def _init_from_cfg(self) -> None:
         cfg = self.cfg
-        self.source_combo.setCurrentText(
-            "Camera" if cfg.source_type == "camera" else "Folder"
-        )
-        self.camera_index_spin.setValue(int(cfg.camera_index))
-        self.folder_label.setText(cfg.sharpcap_folder or "(no folder selected)")
-        self.baud_edit.setText(str(cfg.baudrate))
-
-        self.deadband_spin.setValue(int(cfg.deadband_px))
-        self.max_pulse_spin.setValue(int(cfg.max_pulse_ms))
-        self.interval_spin.setValue(float(cfg.correction_interval))
-        self.manual_pulse_spin.setValue(int(cfg.manual_pulse_ms))
-        self.threshold_spin.setValue(int(cfg.threshold))
-        self.min_radius_spin.setValue(int(cfg.min_radius))
-        self.invert_ra_check.setChecked(bool(cfg.invert_ra))
-        self.invert_dec_check.setChecked(bool(cfg.invert_dec))
-
-        # Pre-select a saved COM port if present in the current list.
-        if cfg.com_port:
-            idx = self.port_combo.findText(cfg.com_port)
-            if idx >= 0:
-                self.port_combo.setCurrentIndex(idx)
-            else:
-                self.port_combo.addItem(cfg.com_port)
-                self.port_combo.setCurrentText(cfg.com_port)
-
-        self._update_calib_label()
-
-    def _write_widgets_to_config(self) -> None:
-        """Copy current widget values back into ``self.cfg``."""
-        cfg = self.cfg
-        cfg.source_type = "camera" if self.source_combo.currentText() == "Camera" else "folder"
-        cfg.camera_index = int(self.camera_index_spin.value())
-        # folder + com_port handled at their event sites; mirror current state.
-        cfg.com_port = self.port_combo.currentText()
-        try:
-            cfg.baudrate = int(self.baud_edit.text())
-        except (TypeError, ValueError):
-            cfg.baudrate = 9600
-
-        cfg.deadband_px = int(self.deadband_spin.value())
-        cfg.max_pulse_ms = int(self.max_pulse_spin.value())
-        cfg.correction_interval = float(self.interval_spin.value())
-        cfg.manual_pulse_ms = int(self.manual_pulse_spin.value())
-        cfg.threshold = int(self.threshold_spin.value())
-        cfg.min_radius = int(self.min_radius_spin.value())
-        cfg.invert_ra = bool(self.invert_ra_check.isChecked())
-        cfg.invert_dec = bool(self.invert_dec_check.isChecked())
-
-    def _update_calib_label(self) -> None:
+        idx = next((i for i, (_, v) in enumerate(_SOURCE_LABELS)
+                    if v == cfg.source_type), 0)
+        self.source_combo.setCurrentIndex(idx)
+        self.cam_index.setValue(cfg.camera_index)
+        if cfg.sharpcap_folder:
+            self.folder_label.setText(cfg.sharpcap_folder)
+        if cfg.ascom_prog_id:
+            self.ascom_label.setText(f"Gewaehlt: {cfg.ascom_prog_id}")
+        self.deadband_spin.setValue(cfg.deadband_px)
+        self.maxpulse_spin.setValue(cfg.max_pulse_ms)
+        self.interval_spin.setValue(cfg.correction_interval)
+        self.manualpulse_spin.setValue(cfg.manual_pulse_ms)
+        self.threshold_spin.setValue(cfg.threshold)
+        self.minradius_spin.setValue(cfg.min_radius)
+        self.invert_ra_check.setChecked(cfg.invert_ra)
+        self.invert_dec_check.setChecked(cfg.invert_dec)
         self.calib_label.setText(
-            "RA: {:.3f} px/ms   DEC: {:.3f} px/ms".format(
-                self.cfg.px_per_ms_ra, self.cfg.px_per_ms_dec
-            )
-        )
+            f"RA: {cfg.px_per_ms_ra:.3f} px/ms   DEC: {cfg.px_per_ms_dec:.3f} px/ms")
+        self._on_source_changed()
 
-    # ----------------------------------------------------------- source I/O -- #
-    def _on_browse_folder(self) -> None:
-        """Choose the SharpCap capture folder."""
+    def _apply_settings(self) -> None:
+        cfg = self.cfg
+        cfg.source_type = _SOURCE_LABELS[self.source_combo.currentIndex()][1]
+        cfg.camera_index = self.cam_index.value()
+        cfg.deadband_px = self.deadband_spin.value()
+        cfg.max_pulse_ms = self.maxpulse_spin.value()
+        cfg.correction_interval = self.interval_spin.value()
+        cfg.manual_pulse_ms = self.manualpulse_spin.value()
+        cfg.threshold = self.threshold_spin.value()
+        cfg.min_radius = self.minradius_spin.value()
+        cfg.invert_ra = self.invert_ra_check.isChecked()
+        cfg.invert_dec = self.invert_dec_check.isChecked()
+
+    def _save_settings(self) -> None:
+        self._apply_settings()
+        save_config(self.cfg)
+        self._log("Einstellungen gespeichert.")
+
+    # ------------------------------------------------------------- Bildquelle
+    def _on_source_changed(self) -> None:
+        stype = _SOURCE_LABELS[self.source_combo.currentIndex()][1]
+        is_cam = stype == "camera"
+        is_folder = stype == "folder"
+        self.cam_label.setVisible(is_cam)
+        self.cam_index.setVisible(is_cam)
+        self.browse_btn.setVisible(is_folder)
+        self.folder_label.setVisible(is_folder)
+        self._apply_settings()
+
+    def _browse_folder(self) -> None:
         start = self.cfg.sharpcap_folder or ""
-        folder = QFileDialog.getExistingDirectory(self, "Select SharpCap folder", start)
+        folder = QFileDialog.getExistingDirectory(self, "SharpCap-Ordner waehlen", start)
         if folder:
             self.cfg.sharpcap_folder = folder
             self.folder_label.setText(folder)
-            self._log(f"SharpCap folder set: {folder}")
+            self._log(f"Ordner: {folder}")
 
-    def _on_toggle_live(self) -> None:
-        """Start or stop the capture loop."""
-        if self.live_btn.isChecked():
-            self._start_live()
-        else:
+    def _toggle_live(self) -> None:
+        if self.timer.isActive():
             self._stop_live()
+        else:
+            self._start_live()
 
     def _start_live(self) -> None:
-        self._write_widgets_to_config()
-        # (Re)create the source from current config.
-        if self.source is not None:
-            try:
+        self._apply_settings()
+        try:
+            if self.source is not None:
                 self.source.release()
-            except Exception:
-                pass
-        self.source = create_source(self.cfg)
+            self.source = create_source(self.cfg)
+        except Exception as exc:
+            self._log(f"Bildquelle-Fehler: {exc}")
+            return
         if not self.source.is_opened():
-            self._log("WARNING: image source is not available — check folder/camera.")
-        self.live = True
-        self.live_btn.setText("Stop Live")
-        self.live_btn.setChecked(True)
+            self._log("Bildquelle nicht bereit (Kamera/Ordner pruefen). "
+                      "Tipp: Quelle 'Demo (Testbild)' funktioniert immer.")
         self.timer.start()
-        self._log("Live capture started.")
+        self.live_btn.setText("[] Bild stoppen")
+        self._log("Bild laeuft.")
 
     def _stop_live(self) -> None:
-        self.live = False
         self.timer.stop()
-        self.live_btn.setText("Start Live")
-        self.live_btn.setChecked(False)
+        if self.guiding:
+            self._set_guiding(False)
         if self.source is not None:
-            try:
-                self.source.release()
-            except Exception:
-                pass
-        self._log("Live capture stopped.")
+            self.source.release()
+            self.source = None
+        self.live_btn.setText(">  Bild starten")
+        self.image_label.setText("Bild gestoppt")
+        self.detect_label.setText("Status: -")
+        self._log("Bild gestoppt.")
 
-    # ------------------------------------------------------------- mount I/O -- #
-    def _refresh_ports(self) -> None:
-        """Repopulate the COM-port combo from the OS."""
-        current = self.port_combo.currentText()
-        self.port_combo.clear()
+    # ------------------------------------------------------------- Montierung
+    def _choose_mount(self) -> None:
+        """ASCOM-Chooser oeffnen, damit der Nutzer die Montierung auswaehlt."""
+        chooser_mount = ASCOMMount(self.cfg.ascom_prog_id, logger=self.logger)
+        prog = chooser_mount.choose()
+        if prog:
+            self.cfg.ascom_prog_id = prog
+            self.ascom_label.setText(f"Gewaehlt: {prog}")
+            save_config(self.cfg)
+
+    def _connect_mount(self) -> None:
+        # Noch nichts gewaehlt? Dann zuerst den Chooser oeffnen.
+        if not self.cfg.ascom_prog_id:
+            self._choose_mount()
+            if not self.cfg.ascom_prog_id:
+                self._log("Bitte zuerst eine Montierung waehlen (ASCOM).")
+                return
         try:
-            ports = list_serial_ports()
+            self.mount = ASCOMMount(self.cfg.ascom_prog_id, logger=self.logger)
+            ok = self.mount.connect()
         except Exception as exc:
-            ports = []
-            self._log(f"WARNING: could not list serial ports: {exc}")
-        self.port_combo.addItems(ports)
-        if current:
-            idx = self.port_combo.findText(current)
-            if idx >= 0:
-                self.port_combo.setCurrentIndex(idx)
-            elif current:
-                self.port_combo.addItem(current)
-                self.port_combo.setCurrentText(current)
-
-    def _on_connect(self) -> None:
-        """Open the serial mount with the selected port/baud."""
-        port = self.port_combo.currentText().strip()
-        if not port:
-            self._log("WARNING: no COM port selected.")
-            return
-        try:
-            baud = int(self.baud_edit.text())
-        except (TypeError, ValueError):
-            baud = 9600
-            self.baud_edit.setText("9600")
-
-        self.cfg.com_port = port
-        self.cfg.baudrate = baud
-
-        # Tear down any prior connection first.
-        self._on_disconnect()
-        self.mount = SerialMount(port, baud, logger=self.logger)
-        ok = self.mount.connect()
-        self._update_mount_status()
+            self._log(f"Verbindungsfehler: {exc}")
+            ok = False
         if ok:
-            self._log(f"Mount connected on {port} @ {baud} baud.")
+            self.mount_status.setText("Montierung: verbunden")
+            self.mount_status.setStyleSheet("color: #0a0;")
         else:
-            self._log(f"WARNING: failed to connect to mount on {port}.")
+            self.mount_status.setText("Montierung: Verbindung fehlgeschlagen")
+            self.mount_status.setStyleSheet("color: #b00;")
+            self._log("Verbindung fehlgeschlagen. Sind ASCOM-Platform + "
+                      "ZWO-ASCOM-Treiber installiert und die AM3 per USB "
+                      "angesteckt und eingeschaltet?")
 
-    def _on_disconnect(self) -> None:
-        """Disconnect the serial mount if connected."""
+    def _disconnect_mount(self) -> None:
+        if self.guiding:
+            self._set_guiding(False)
         if self.mount is not None:
             try:
+                self.mount.stop()
                 self.mount.disconnect()
-            except Exception as exc:
-                self._log(f"WARNING: error during disconnect: {exc}")
+            except Exception:
+                pass
             self.mount = None
-        self._update_mount_status()
-
-    def _update_mount_status(self) -> None:
-        connected = self.mount is not None and self.mount.is_connected()
-        if connected:
-            self.mount_status_label.setText(f"Mount: connected ({self.cfg.com_port})")
-            self.mount_status_label.setStyleSheet("color: #0a0;")
-        else:
-            self.mount_status_label.setText("Mount: disconnected")
-            self.mount_status_label.setStyleSheet("color: #b00;")
+        self.mount_status.setText("Montierung: getrennt")
+        self.mount_status.setStyleSheet("color: #b00;")
+        self._log("Montierung getrennt.")
 
     def _mount_connected(self) -> bool:
         return self.mount is not None and self.mount.is_connected()
 
-    # ----------------------------------------------------------- manual slew -- #
     def _manual_pulse(self, direction: str) -> None:
-        """Issue a manual guide pulse in ``direction`` (N/S/E/W)."""
         if not self._mount_connected():
-            self._log("Manual pulse ignored: mount not connected.")
+            self._log("Bewegungstest: bitte zuerst Montierung verbinden.")
             return
-        ms = int(self.manual_pulse_spin.value())
-        self.cfg.manual_pulse_ms = ms
+        self._apply_settings()
         try:
-            self.mount.pulse(direction, ms)
+            self.mount.pulse(direction, self.cfg.manual_pulse_ms)
         except Exception as exc:
-            self._log(f"WARNING: manual pulse failed: {exc}")
+            self._log(f"Bewegungsfehler: {exc}")
 
-    def _on_stop(self) -> None:
-        """Stop all mount motion (manual Stop button)."""
+    def _manual_stop(self) -> None:
         if self.mount is not None:
             try:
                 self.mount.stop()
-            except Exception as exc:
-                self._log(f"WARNING: stop failed: {exc}")
+            except Exception:
+                pass
 
-    def _on_emergency_stop(self) -> None:
-        """EMERGENCY STOP: halt motion AND disable Auto Guide."""
-        self.auto_guide_check.setChecked(False)
-        if self.mount is not None:
+    # ---------------------------------------------------------------- Guiding
+    def _toggle_guiding(self) -> None:
+        self._set_guiding(not self.guiding)
+
+    def _set_guiding(self, on: bool) -> None:
+        if on:
+            if not self.timer.isActive():
+                self._start_live()
+            if not self._mount_connected():
+                self._log("Guiding nicht gestartet: bitte zuerst Montierung "
+                          "verbinden (Schritt 2).")
+                return
+            self._apply_settings()
+            self.guiding = True
+            self.last_correction = 0.0
+            self.guide_btn.setText("GUIDING STOPPEN")
+            self.guide_btn.setStyleSheet(
+                "QPushButton { background-color: #c0392b; color: white; "
+                "font-size: 16px; font-weight: bold; border-radius: 6px; }"
+                "QPushButton:pressed { background-color: #922b21; }")
+            self._log("Guiding gestartet.")
+        else:
+            self.guiding = False
+            self.guide_btn.setText("GUIDING STARTEN")
+            self.guide_btn.setStyleSheet(
+                "QPushButton { background-color: #1e8449; color: white; "
+                "font-size: 16px; font-weight: bold; border-radius: 6px; }"
+                "QPushButton:pressed { background-color: #166036; }")
+            self._log("Guiding gestoppt.")
+
+    def _do_guiding(self, det: SunDetection) -> None:
+        # Sicherheit: nur bei aktivem Guiding, erkannter Sonne und Verbindung.
+        if not (self.guiding and det.found and self._mount_connected()):
+            return
+        now = time.monotonic()
+        if now - self.last_correction < self.cfg.correction_interval:
+            return
+        cfg = self.cfg
+        moved = False
+        if abs(det.dx) > cfg.deadband_px:
+            ra_dir = "E" if det.dx > 0 else "W"
+            if cfg.invert_ra:
+                ra_dir = _opposite(ra_dir)
+            ms = _pulse_ms_for(abs(det.dx), cfg.px_per_ms_ra, cfg.max_pulse_ms)
             try:
-                self.mount.stop()
+                self.mount.pulse(ra_dir, ms)
+                moved = True
             except Exception as exc:
-                self._log(f"WARNING: emergency stop send failed: {exc}")
-        self._log("EMERGENCY STOP triggered — Auto Guide disabled.")
+                self._log(f"Guiding RA-Fehler: {exc}")
+        if abs(det.dy) > cfg.deadband_px:
+            dec_dir = "S" if det.dy > 0 else "N"
+            if cfg.invert_dec:
+                dec_dir = _opposite(dec_dir)
+            ms = _pulse_ms_for(abs(det.dy), cfg.px_per_ms_dec, cfg.max_pulse_ms)
+            try:
+                self.mount.pulse(dec_dir, ms)
+                moved = True
+            except Exception as exc:
+                self._log(f"Guiding DEC-Fehler: {exc}")
+        if moved:
+            self.last_correction = now
 
-    # ----------------------------------------------------------- calibration -- #
-    def _on_calibrate(self) -> None:
-        """Basic calibration: pulse E then N a known duration, measure px/ms.
-
-        Measures the sun-center displacement between frames taken before and
-        after each pulse and stores the result into the config. Intentionally
-        simple — it assumes a stable sun and short settling time.
-        """
+    def _calibrate(self) -> None:
         if not self._mount_connected():
-            self._log("Calibration aborted: mount not connected.")
+            self._log("Kalibrierung: bitte zuerst Montierung verbinden.")
             return
-        if not self.live or self.source is None:
-            self._log("Calibration aborted: start Live capture first.")
-            return
-
-        calib_ms = 500  # fixed calibration pulse length
-
-        # --- RA axis (East) --- #
-        before = self._current_center()
-        if before is None:
-            self._log("Calibration aborted: sun not detected before RA pulse.")
-            return
-        try:
-            self.mount.pulse("E", calib_ms)
-        except Exception as exc:
-            self._log(f"Calibration RA pulse failed: {exc}")
-            return
-        self._settle(calib_ms)
-        after = self._current_center()
-        if after is None:
-            self._log("Calibration: sun lost after RA pulse; RA not calibrated.")
-        else:
-            dist = float(np.hypot(after[0] - before[0], after[1] - before[1]))
-            self.cfg.px_per_ms_ra = (dist / calib_ms) if calib_ms else 0.0
-            self._log(f"Calibrated RA: {self.cfg.px_per_ms_ra:.4f} px/ms ({dist:.1f} px).")
-
-        # --- DEC axis (North) --- #
-        before = self._current_center()
-        if before is None:
-            self._log("Calibration: sun not detected before DEC pulse.")
-            self._update_calib_label()
-            return
-        try:
-            self.mount.pulse("N", calib_ms)
-        except Exception as exc:
-            self._log(f"Calibration DEC pulse failed: {exc}")
-            self._update_calib_label()
-            return
-        self._settle(calib_ms)
-        after = self._current_center()
-        if after is None:
-            self._log("Calibration: sun lost after DEC pulse; DEC not calibrated.")
-        else:
-            dist = float(np.hypot(after[0] - before[0], after[1] - before[1]))
-            self.cfg.px_per_ms_dec = (dist / calib_ms) if calib_ms else 0.0
-            self._log(f"Calibrated DEC: {self.cfg.px_per_ms_dec:.4f} px/ms ({dist:.1f} px).")
-
-        self._update_calib_label()
-
-    def _current_center(self) -> Optional[tuple]:
-        """Grab a frame, detect the sun, and return its (x, y) center or None."""
         if self.source is None:
-            return None
-        frame = self.source.get_frame()
-        if frame is None:
-            return None
-        det = detect_sun(frame, int(self.threshold_spin.value()),
-                         int(self.min_radius_spin.value()))
-        if det.found and det.center is not None:
-            return det.center
-        return None
+            self._log("Kalibrierung: bitte zuerst Bild starten.")
+            return
+        self._apply_settings()
+        try:
+            for axis, direction, attr in (("RA", "E", "px_per_ms_ra"),
+                                          ("DEC", "N", "px_per_ms_dec")):
+                d0 = detect_sun(self.source.get_frame(),
+                                self.cfg.threshold, self.cfg.min_radius)
+                if not d0.found or d0.center is None:
+                    self._log(f"Kalibrierung {axis}: keine Sonne erkannt.")
+                    continue
+                ms = max(200, self.cfg.manual_pulse_ms)
+                self.mount.pulse(direction, ms)
+                self._wait(ms / 1000.0 + 0.6)
+                d1 = detect_sun(self.source.get_frame(),
+                                self.cfg.threshold, self.cfg.min_radius)
+                if not d1.found or d1.center is None:
+                    self._log(f"Kalibrierung {axis}: Sonne verloren.")
+                    continue
+                dist = ((d1.center[0] - d0.center[0]) ** 2
+                        + (d1.center[1] - d0.center[1]) ** 2) ** 0.5
+                val = round(dist / ms, 4) if ms > 0 else 0.0
+                setattr(self.cfg, attr, val)
+                self._log(f"Kalibrierung {axis}: {dist:.1f} px in {ms} ms "
+                          f"-> {val:.4f} px/ms")
+            self.calib_label.setText(
+                f"RA: {self.cfg.px_per_ms_ra:.3f} px/ms   "
+                f"DEC: {self.cfg.px_per_ms_dec:.3f} px/ms")
+            save_config(self.cfg)
+        except Exception as exc:
+            self._log(f"Kalibrierungsfehler: {exc}")
 
-    def _settle(self, pulse_ms: int) -> None:
-        """Wait for a pulse to complete plus a short settle window.
+    def _wait(self, seconds: float) -> None:
+        """Kurze Wartepause, ohne die Oberflaeche einzufrieren."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            QApplication.processEvents()
+            time.sleep(0.01)
 
-        Uses a blocking sleep only during the (manual) calibration step — the
-        capture timer is single-shot driven, so this does not affect the live
-        loop's safety guarantees.
-        """
-        time.sleep((pulse_ms / 1000.0) + 0.3)
+    # --------------------------------------------------------------- Not-Aus
+    def _emergency_stop(self) -> None:
+        self._set_guiding(False)
+        if self.mount is not None:
+            try:
+                self.mount.stop()
+            except Exception:
+                pass
+        self._log("NOT-AUS ausgeloest - alle Bewegungen gestoppt.")
 
-    # -------------------------------------------------------------- settings -- #
-    def _on_save_settings(self) -> None:
-        """Persist current widget state to config.json."""
-        self._write_widgets_to_config()
-        save_config(self.cfg)
-        self._log("Settings saved.")
-
-    # ----------------------------------------------------------- capture loop #
-    def _tick(self) -> None:
-        """One capture/display/guide iteration. Never propagates exceptions."""
+    # ---------------------------------------------------------- Aufnahmeschleife
+    def _on_tick(self) -> None:
         try:
             if self.source is None:
                 return
             frame = self.source.get_frame()
             if frame is None:
-                self._set_image_message("No frame")
+                self.detect_label.setText("Status: kein Bild")
                 return
-
-            detection = detect_sun(
-                frame,
-                int(self.threshold_spin.value()),
-                int(self.min_radius_spin.value()),
-            )
-            self.last_detection = detection
-
-            overlay = draw_overlay(frame, detection)
-            self._show_frame(overlay)
-            self._update_status(detection)
-
-            # Guiding step — gated by every safety rule inside.
-            if self.auto_guide_check.isChecked():
-                self._guiding_step(detection)
+            det = detect_sun(frame, self.cfg.threshold, self.cfg.min_radius)
+            self.last_detection = det
+            overlay = draw_overlay(frame, det)
+            self._show_image(overlay)
+            if det.found:
+                self.detect_label.setText(
+                    f"Sonne erkannt   dx={det.dx:.0f}  dy={det.dy:.0f}  "
+                    f"r={det.radius:.0f}")
+            else:
+                self.detect_label.setText(f"Status: {det.status}")
+            if self.guiding:
+                self._do_guiding(det)
         except Exception as exc:
-            # A single bad frame must never crash the UI.
-            self._log(f"Tick error: {exc}")
+            self._log(f"Bildverarbeitung-Fehler: {exc}")
 
-    def _guiding_step(self, detection: SunDetection) -> None:
-        """Apply one correction pulse per axis if error exceeds the deadband.
-
-        SAFETY: returns immediately unless Auto Guide is on, the sun is found,
-        and the mount is connected. Never moves when the sun is not found.
-        """
-        # Re-check all safety preconditions (defensive; caller also checks).
-        if not self.auto_guide_check.isChecked():
+    def _show_image(self, img: np.ndarray) -> None:
+        if img is None:
             return
-        if detection is None or not detection.found:
-            return
-        if not self._mount_connected():
-            return
-
-        now = time.monotonic()
-        cfg = self.cfg
-        # Keep config in sync with live settings widgets.
-        cfg.deadband_px = int(self.deadband_spin.value())
-        cfg.max_pulse_ms = int(self.max_pulse_spin.value())
-        cfg.correction_interval = float(self.interval_spin.value())
-        cfg.invert_ra = bool(self.invert_ra_check.isChecked())
-        cfg.invert_dec = bool(self.invert_dec_check.isChecked())
-
-        if (now - self.last_correction_time) < cfg.correction_interval:
-            return
-
-        dx, dy = detection.dx, detection.dy
-
-        # --- RA axis --- #
-        if abs(dx) > cfg.deadband_px:
-            ra_dir = "E" if dx > 0 else "W"
-            if cfg.invert_ra:
-                ra_dir = opposite(ra_dir)
-            ms = pulse_ms_for(abs(dx), cfg.px_per_ms_ra, cfg.max_pulse_ms)
-            try:
-                self.mount.pulse(ra_dir, ms)
-            except Exception as exc:
-                self._log(f"WARNING: RA guide pulse failed: {exc}")
-
-        # --- DEC axis --- #
-        if abs(dy) > cfg.deadband_px:
-            dec_dir = "S" if dy > 0 else "N"
-            if cfg.invert_dec:
-                dec_dir = opposite(dec_dir)
-            ms = pulse_ms_for(abs(dy), cfg.px_per_ms_dec, cfg.max_pulse_ms)
-            try:
-                self.mount.pulse(dec_dir, ms)
-            except Exception as exc:
-                self._log(f"WARNING: DEC guide pulse failed: {exc}")
-
-        self.last_correction_time = now
-
-    # ------------------------------------------------------------- rendering -- #
-    def _show_frame(self, bgr: np.ndarray) -> None:
-        """Convert a BGR ndarray to a scaled QPixmap and display it."""
-        pix = self._bgr_to_pixmap(bgr)
-        if pix is None:
-            return
-        scaled = pix.scaled(
+        if img.ndim == 2:  # Graustufen -> 3 Kanaele
+            img = np.stack([img] * 3, axis=-1)
+        h, w, ch = img.shape
+        rgb = np.ascontiguousarray(img[:, :, ::-1])  # BGR -> RGB
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg.copy())
+        self.image_label.setPixmap(pix.scaled(
             self.image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.image_label.setPixmap(scaled)
+            Qt.TransformationMode.SmoothTransformation))
 
-    @staticmethod
-    def _bgr_to_pixmap(bgr: np.ndarray) -> Optional[QPixmap]:
-        """Convert an OpenCV BGR uint8 ndarray to a QPixmap (RGB888)."""
-        if bgr is None or bgr.size == 0:
-            return None
+    # ------------------------------------------------------------------ Hilfe
+    def _log(self, message: str) -> None:
+        self.log_view.appendPlainText(message)
+        print(f"[gui] {message}")
+
+    def closeEvent(self, event):  # noqa: N802 (Qt-Signatur)
         try:
-            # Ensure 3-channel BGR uint8.
-            if bgr.ndim == 2:
-                arr = np.stack([bgr] * 3, axis=-1)
-            else:
-                arr = bgr
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-            # BGR -> RGB without OpenCV (avoid an extra cv2 import here).
-            rgb = np.ascontiguousarray(arr[:, :, ::-1])
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            image = QImage(
-                rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888
-            )
-            # .copy() detaches the QImage from the numpy buffer's lifetime.
-            return QPixmap.fromImage(image.copy())
-        except Exception:
-            return None
-
-    def _set_image_message(self, text: str) -> None:
-        self.image_label.setPixmap(QPixmap())  # clear
-        self.image_label.setText(text)
-
-    def _update_status(self, detection: SunDetection) -> None:
-        """Refresh status indicators (mount status is updated on connect)."""
-        self._update_mount_status()
-        # The overlay already shows dx/dy/radius/status; nothing else required
-        # here, but keep the hook for future status widgets.
-
-    # ----------------------------------------------------------- lifecycle --- #
-    def closeEvent(self, event) -> None:
-        """Ensure motion is stopped and resources released on close."""
-        try:
-            self.timer.stop()
-        except Exception:
-            pass
-        try:
-            if self.mount is not None and self.mount.is_connected():
+            if self.mount is not None:
                 self.mount.stop()
                 self.mount.disconnect()
-        except Exception:
-            pass
-        try:
             if self.source is not None:
                 self.source.release()
         except Exception:

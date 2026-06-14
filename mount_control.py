@@ -25,7 +25,13 @@ import logging
 import serial
 from serial.tools import list_ports
 
-__all__ = ["MountInterface", "SerialMount", "list_serial_ports"]
+__all__ = [
+    "MountInterface",
+    "SerialMount",
+    "ASCOMMount",
+    "list_serial_ports",
+    "ascom_available",
+]
 
 # Valid direction strings (uppercase as used by the public API).
 _VALID_DIRECTIONS = ("N", "S", "E", "W")
@@ -237,3 +243,147 @@ class SerialMount(MountInterface):
             return
 
         self._send(f":Mg{d.lower()}{ms_clamped:04d}#")
+
+
+# ASCOM GuideDirections (ASCOM standard enum values).
+_ASCOM_GUIDE = {"N": 0, "S": 1, "E": 2, "W": 3}
+
+
+def ascom_available() -> bool:
+    """True if the ASCOM/pywin32 stack can be imported (i.e. on Windows)."""
+    try:
+        import win32com.client  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+class ASCOMMount(MountInterface):
+    """Mount backend that drives the AM3 via its ASCOM Telescope driver.
+
+    This is the path that actually works for the ZWO AM3 on Windows: install the
+    ASCOM Platform and the ZWO ASCOM mount driver, pick the mount once via the
+    ASCOM Chooser, then guide using the standard ``PulseGuide`` method.
+
+    All ASCOM/COM access uses late-bound ``win32com.client.Dispatch`` and is
+    imported lazily inside the methods, so this module still imports on
+    platforms without pywin32 (e.g. for syntax checking on macOS/Linux).
+    """
+
+    def __init__(self, prog_id: str = "", logger: logging.Logger | None = None) -> None:
+        self.prog_id = prog_id or ""
+        self.logger = logger
+        self._scope = None  # the COM object once connected
+
+    # ------------------------------------------------------------------ logging
+    def _log(self, message: str, level: int = logging.INFO) -> None:
+        if self.logger is not None:
+            self.logger.log(level, message)
+        else:
+            print(message)
+
+    # ------------------------------------------------------------------ chooser
+    def choose(self) -> str:
+        """Open the ASCOM Chooser so the user can pick the telescope/mount.
+
+        Returns the selected ProgID (also stored on ``self.prog_id``), or the
+        previous value if the user cancels. Never raises.
+        """
+        try:
+            import win32com.client
+            chooser = win32com.client.Dispatch("ASCOM.Utilities.Chooser")
+            chooser.DeviceType = "Telescope"
+            selected = chooser.Choose(self.prog_id or "")
+            if selected:
+                self.prog_id = selected
+                self._log(f"ASCOM-Geraet gewaehlt: {selected}")
+        except Exception as exc:
+            self._log(f"ASCOM-Chooser nicht verfuegbar: {exc}", level=logging.ERROR)
+        return self.prog_id
+
+    # --------------------------------------------------------------- connection
+    def connect(self) -> bool:
+        """Connect to the chosen ASCOM telescope. Returns True on success."""
+        if not self.prog_id:
+            self._log("Keine ASCOM-Montierung gewaehlt.", level=logging.WARNING)
+            return False
+        try:
+            import win32com.client
+            self._scope = win32com.client.Dispatch(self.prog_id)
+            self._scope.Connected = True
+            if bool(self._scope.Connected):
+                self._log(f"ASCOM-Montierung verbunden: {self.prog_id}")
+                try:
+                    if not self._scope.CanPulseGuide:
+                        self._log("Warnung: Treiber meldet kein PulseGuide.",
+                                  level=logging.WARNING)
+                except Exception:
+                    pass
+                return True
+            self._log("ASCOM: Connected=True wurde nicht uebernommen.",
+                      level=logging.ERROR)
+            return False
+        except Exception as exc:
+            self._scope = None
+            self._log(f"ASCOM-Verbindung fehlgeschlagen: {exc}", level=logging.ERROR)
+            return False
+
+    def disconnect(self) -> None:
+        """Disconnect from the mount. Never raises."""
+        if self._scope is not None:
+            try:
+                self._scope.Connected = False
+            except Exception as exc:  # pragma: no cover - defensive
+                self._log(f"Fehler beim Trennen: {exc}", level=logging.WARNING)
+            finally:
+                self._scope = None
+                self._log("ASCOM-Montierung getrennt")
+
+    def is_connected(self) -> bool:
+        try:
+            return self._scope is not None and bool(self._scope.Connected)
+        except Exception:
+            return False
+
+    # -------------------------------------------------------------------- motion
+    def move(self, direction: str) -> None:
+        """Continuous slew is not used for guiding; fall back to a guide pulse."""
+        self.pulse(direction, 300)
+
+    def stop(self) -> None:
+        """Abort any motion immediately (AbortSlew)."""
+        if not self.is_connected():
+            return
+        try:
+            self._scope.AbortSlew()
+            self._log("ASCOM: AbortSlew (Stop)")
+        except Exception as exc:
+            self._log(f"ASCOM Stop-Fehler: {exc}", level=logging.WARNING)
+
+    def pulse(self, direction: str, ms: int) -> None:
+        """Issue a bounded guide pulse via ASCOM ``PulseGuide``.
+
+        ``ms`` is clamped to [0, 1000]; ms <= 0 is ignored. Directions map to the
+        ASCOM GuideDirections enum (N=0, S=1, E=2, W=3).
+        """
+        d = (direction or "").strip().upper()
+        if d not in _ASCOM_GUIDE:
+            self._log(f"Ignoriere Puls: ungueltige Richtung {direction!r}",
+                      level=logging.WARNING)
+            return
+        if not self.is_connected():
+            self._log("Kann nicht senden: ASCOM-Montierung nicht verbunden.",
+                      level=logging.WARNING)
+            return
+        try:
+            ms_int = int(ms)
+        except (TypeError, ValueError):
+            return
+        ms_clamped = max(_PULSE_MIN_MS, min(_PULSE_MAX_MS, ms_int))
+        if ms_clamped <= 0:
+            return
+        try:
+            self._scope.PulseGuide(_ASCOM_GUIDE[d], ms_clamped)
+            self._log(f"ASCOM PulseGuide {d} {ms_clamped} ms")
+        except Exception as exc:
+            self._log(f"ASCOM PulseGuide-Fehler: {exc}", level=logging.ERROR)

@@ -4,3 +4,5 @@ opencv-python
 numpy
 pyserial
 PyQt6
+# Nur Windows: Zugriff auf den ASCOM-Treiber (COM) der Montierung
+pywin32; sys_platform == "win32"

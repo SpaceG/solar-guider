@@ -17,12 +17,14 @@ class Config:
     """All persisted settings for the app, with safe defaults."""
 
     # --- image source ---
-    source_type: str = "folder"      # "camera" or "folder"
+    source_type: str = "demo"        # "demo", "camera" or "folder"
     camera_index: int = 0
     sharpcap_folder: str = ""
     # --- mount serial ---
     com_port: str = ""
     baudrate: int = 9600
+    # --- mount ASCOM (Windows) ---
+    ascom_prog_id: str = ""   # ASCOM Telescope ProgID, im ASCOM-Chooser gewählt
     # --- detection ---
     threshold: int = 60              # 0-255 grayscale threshold
     min_radius: int = 20             # ignore contours smaller than this radius (px)
