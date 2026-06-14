@@ -44,7 +44,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -95,6 +95,9 @@ class MainWindow(QMainWindow):
         self.guiding = False        # läuft Auto-Guiding gerade?
         self.last_correction = 0.0  # Zeitpunkt der letzten Korrektur (monotonic)
         self.last_detection: SunDetection | None = None
+        # Halte-Position (x, y): wo die Sonne beim Guiding-Start war. Das Guiding
+        # haelt DIESE Position, nicht die Bildmitte (wichtig fuer Rand/Protuberanz).
+        self.guide_target = None
 
         self.setWindowTitle(f"Sonnen-Guider v{APP_VERSION} – ZWO AM3")
         self.resize(1040, 660)
@@ -254,7 +257,8 @@ class MainWindow(QMainWindow):
         box = QGroupBox("3. Guiding")
         lay = QVBoxLayout(box)
 
-        info = QLabel("Haelt die Sonne automatisch in der Bildmitte.")
+        info = QLabel("Haelt die Sonne dort, wo sie beim Start ist - auch am "
+                      "Rand (z.B. fuer eine Protuberanz).")
         info.setWordWrap(True)
         lay.addWidget(info)
 
@@ -567,6 +571,13 @@ class MainWindow(QMainWindow):
                 self._update_tracking_label()
             self.guiding = True
             self.last_correction = 0.0
+            # Aktuelle Sonnenposition als Halte-Ziel merken (Mitte ODER Rand).
+            if self.last_detection is not None and self.last_detection.found:
+                self.guide_target = self.last_detection.center
+                self._log(f"Halte-Position gesetzt bei {self.guide_target}.")
+            else:
+                self.guide_target = None
+                self._log("Halte-Position wird beim ersten erkannten Bild gesetzt.")
             self.guide_btn.setText("GUIDING STOPPEN")
             self.guide_btn.setStyleSheet(
                 "QPushButton { background-color: #c0392b; color: white; "
@@ -575,6 +586,7 @@ class MainWindow(QMainWindow):
             self._log("Guiding gestartet.")
         else:
             self.guiding = False
+            self.guide_target = None
             self.guide_btn.setText("GUIDING STARTEN")
             self.guide_btn.setStyleSheet(
                 "QPushButton { background-color: #1e8449; color: white; "
@@ -586,26 +598,37 @@ class MainWindow(QMainWindow):
         # Sicherheit: nur bei aktivem Guiding, erkannter Sonne und Verbindung.
         if not (self.guiding and det.found and self._mount_connected()):
             return
+        if det.center is None:
+            return
+        # Halte-Ziel = Position beim Start (nicht die Bildmitte!). So bleibt auch
+        # eine Rand-/Protuberanz-Einstellung stehen.
+        if self.guide_target is None:
+            self.guide_target = det.center
+            self._log(f"Halte-Position gesetzt bei {self.guide_target}.")
+            return
         now = time.monotonic()
         if now - self.last_correction < self.cfg.correction_interval:
             return
         cfg = self.cfg
+        # Abweichung von der Halte-Position.
+        ex = det.center[0] - self.guide_target[0]
+        ey = det.center[1] - self.guide_target[1]
         moved = False
-        if abs(det.dx) > cfg.deadband_px:
-            ra_dir = "E" if det.dx > 0 else "W"
+        if abs(ex) > cfg.deadband_px:
+            ra_dir = "E" if ex > 0 else "W"
             if cfg.invert_ra:
                 ra_dir = _opposite(ra_dir)
-            ms = _pulse_ms_for(abs(det.dx), cfg.px_per_ms_ra, cfg.max_pulse_ms)
+            ms = _pulse_ms_for(abs(ex), cfg.px_per_ms_ra, cfg.max_pulse_ms)
             try:
                 self.mount.pulse(ra_dir, ms)
                 moved = True
             except Exception as exc:
                 self._log(f"Guiding RA-Fehler: {exc}")
-        if abs(det.dy) > cfg.deadband_px:
-            dec_dir = "S" if det.dy > 0 else "N"
+        if abs(ey) > cfg.deadband_px:
+            dec_dir = "S" if ey > 0 else "N"
             if cfg.invert_dec:
                 dec_dir = _opposite(dec_dir)
-            ms = _pulse_ms_for(abs(det.dy), cfg.px_per_ms_dec, cfg.max_pulse_ms)
+            ms = _pulse_ms_for(abs(ey), cfg.px_per_ms_dec, cfg.max_pulse_ms)
             try:
                 self.mount.pulse(dec_dir, ms)
                 moved = True
