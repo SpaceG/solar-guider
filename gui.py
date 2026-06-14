@@ -44,7 +44,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -98,6 +98,9 @@ class MainWindow(QMainWindow):
         # Halte-Position (x, y): wo die Sonne beim Guiding-Start war. Das Guiding
         # haelt DIESE Position, nicht die Bildmitte (wichtig fuer Rand/Protuberanz).
         self.guide_target = None
+        # Vorherige Abweichung je Achse — fuer automatische Richtungs-Erkennung.
+        self._prev_err_ra = None
+        self._prev_err_dec = None
 
         self.setWindowTitle(f"Sonnen-Guider v{APP_VERSION} – ZWO AM3")
         self.resize(1040, 660)
@@ -578,6 +581,8 @@ class MainWindow(QMainWindow):
             else:
                 self.guide_target = None
                 self._log("Halte-Position wird beim ersten erkannten Bild gesetzt.")
+            self._prev_err_ra = None
+            self._prev_err_dec = None
             self.guide_btn.setText("GUIDING STOPPEN")
             self.guide_btn.setStyleSheet(
                 "QPushButton { background-color: #c0392b; color: white; "
@@ -614,14 +619,30 @@ class MainWindow(QMainWindow):
         ex = det.center[0] - self.guide_target[0]
         ey = det.center[1] - self.guide_target[1]
         if abs(ex) <= cfg.deadband_px and abs(ey) <= cfg.deadband_px:
+            self._prev_err_ra = None
+            self._prev_err_dec = None
             return  # im Totband -> Ruhe lassen
         # Pro Zyklus die Achse mit der groesseren Abweichung korrigieren.
         if abs(ex) >= abs(ey):
+            # Auto-Richtung: wenn die letzte RA-Korrektur den Fehler klar groesser
+            # gemacht hat, war die Richtung verkehrt -> automatisch umdrehen.
+            if (self._prev_err_ra is not None
+                    and abs(ex) > abs(self._prev_err_ra) + 8):
+                cfg.invert_ra = not cfg.invert_ra
+                self.invert_ra_check.setChecked(cfg.invert_ra)
+                self._log("Richtung RA automatisch umgedreht.")
+            self._prev_err_ra = ex
             direction = "E" if ex > 0 else "W"
             if cfg.invert_ra:
                 direction = _opposite(direction)
             error = ex
         else:
+            if (self._prev_err_dec is not None
+                    and abs(ey) > abs(self._prev_err_dec) + 8):
+                cfg.invert_dec = not cfg.invert_dec
+                self.invert_dec_check.setChecked(cfg.invert_dec)
+                self._log("Richtung DEC automatisch umgedreht.")
+            self._prev_err_dec = ey
             direction = "S" if ey > 0 else "N"
             if cfg.invert_dec:
                 direction = _opposite(direction)
