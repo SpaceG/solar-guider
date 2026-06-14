@@ -31,7 +31,7 @@ class Config:
     # --- guiding ---
     deadband_px: int = 20
     max_pulse_ms: int = 300
-    correction_interval: float = 1.0  # seconds between corrections
+    correction_interval: float = 0.5  # Sekunden zwischen Korrekturen
     manual_pulse_ms: int = 150       # Bewegungsdauer pro manuellem Klick (ms)
     invert_ra: bool = False
     invert_dec: bool = False

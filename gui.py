@@ -44,7 +44,7 @@ from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
 # Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
@@ -613,29 +613,38 @@ class MainWindow(QMainWindow):
         # Abweichung von der Halte-Position.
         ex = det.center[0] - self.guide_target[0]
         ey = det.center[1] - self.guide_target[1]
-        moved = False
-        if abs(ex) > cfg.deadband_px:
-            ra_dir = "E" if ex > 0 else "W"
+        if abs(ex) <= cfg.deadband_px and abs(ey) <= cfg.deadband_px:
+            return  # im Totband -> Ruhe lassen
+        # Pro Zyklus die Achse mit der groesseren Abweichung korrigieren.
+        if abs(ex) >= abs(ey):
+            direction = "E" if ex > 0 else "W"
             if cfg.invert_ra:
-                ra_dir = _opposite(ra_dir)
-            ms = _pulse_ms_for(abs(ex), cfg.px_per_ms_ra, cfg.max_pulse_ms)
-            try:
-                self.mount.pulse(ra_dir, ms)
-                moved = True
-            except Exception as exc:
-                self._log(f"Guiding RA-Fehler: {exc}")
-        if abs(ey) > cfg.deadband_px:
-            dec_dir = "S" if ey > 0 else "N"
+                direction = _opposite(direction)
+            error = ex
+        else:
+            direction = "S" if ey > 0 else "N"
             if cfg.invert_dec:
-                dec_dir = _opposite(dec_dir)
-            ms = _pulse_ms_for(abs(ey), cfg.px_per_ms_dec, cfg.max_pulse_ms)
-            try:
-                self.mount.pulse(dec_dir, ms)
-                moved = True
-            except Exception as exc:
-                self._log(f"Guiding DEC-Fehler: {exc}")
-        if moved:
-            self.last_correction = now
+                direction = _opposite(direction)
+            error = ey
+        self._guide_nudge(direction, error)
+        self.last_correction = now
+
+    def _guide_nudge(self, direction: str, error_px: float) -> None:
+        """Korrektur per echter Bewegung (MoveAxis); Dauer ~ Abweichung.
+
+        Deutlich staerker als ein Guide-Puls. Die Bewegung stoppt selbst nach
+        ``ms`` (nicht blockierend ueber QTimer.singleShot).
+        """
+        ms = int(min(self.cfg.max_pulse_ms, max(40, abs(error_px) * 2)))
+        try:
+            if hasattr(self.mount, "slew_start"):
+                self.mount.slew_start(direction)
+                QTimer.singleShot(ms, self.mount.slew_stop)
+            else:
+                self.mount.pulse(direction, ms)
+            self._log(f"Korrektur {direction} {ms} ms (Abw. {int(error_px)} px)")
+        except Exception as exc:
+            self._log(f"Guiding-Fehler: {exc}")
 
     def _calibrate(self) -> None:
         if not self._mount_connected():
