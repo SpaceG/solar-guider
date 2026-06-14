@@ -42,6 +42,9 @@ from config import Config, load_config, save_config
 from image_processing import SunDetection, detect_sun, draw_overlay
 from mount_control import ASCOMMount
 
+# Versionsnummer der App (wird in der Fensterleiste und im Log angezeigt).
+APP_VERSION = "0.3.1"
+
 # Anzeigetext der Bildquellen-Auswahl <-> interner cfg.source_type-Wert.
 _SOURCE_LABELS = [
     ("Demo (Testbild)", "demo"),
@@ -92,7 +95,7 @@ class MainWindow(QMainWindow):
         self.last_correction = 0.0  # Zeitpunkt der letzten Korrektur (monotonic)
         self.last_detection: SunDetection | None = None
 
-        self.setWindowTitle("Sonnen-Guider – ZWO AM3")
+        self.setWindowTitle(f"Sonnen-Guider v{APP_VERSION} – ZWO AM3")
         self.resize(1040, 660)
 
         self._build_ui()
@@ -111,8 +114,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._on_tick)
         self.timer.setInterval(66)
 
-        self._log("Bereit. Tipp: oben rechts auf 'Bild starten' klicken - "
-                  "es laeuft ein Demo-Testbild.")
+        self._log(f"Sonnen-Guider v{APP_VERSION} bereit. Tipp: oben rechts auf "
+                  "'Bild starten' klicken - es laeuft ein Demo-Testbild.")
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
